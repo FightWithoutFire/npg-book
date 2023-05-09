@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/tls"
+	"crypto/x509"
 	"encoding/binary"
 	"encoding/json"
 	"errors"
@@ -2107,4 +2108,321 @@ func TestTLSBaidu(t *testing.T) {
 	t.Log(state.VerifiedChains[0][0].Issuer.Organization[0])
 
 	_ = conn.Close()
+}
+
+type TLSServer struct {
+	ctx       context.Context
+	ready     chan struct{}
+	addr      string
+	maxIdle   time.Duration
+	tlsConfig *tls.Config
+}
+
+func (ts *TLSServer) Ready() {
+	if ts.ready != nil {
+		<-ts.ready
+	}
+}
+
+func NewTLSServer(ctx context.Context, address string, maxIdle time.Duration, tlsConfig *tls.Config) *TLSServer {
+	return &TLSServer{
+		ctx:       ctx,
+		ready:     make(chan struct{}),
+		addr:      address,
+		maxIdle:   maxIdle,
+		tlsConfig: tlsConfig,
+	}
+}
+
+func (ts *TLSServer) ListenAndServeTLS(certFn, keyFn string) error {
+	if ts.addr == "" {
+		ts.addr = "localhost:443"
+	}
+
+	listen, err := net.Listen("tcp", ts.addr)
+	if err != nil {
+		return fmt.Errorf("binding to tcp %s: %w", ts.addr, err)
+	}
+
+	if ts.ctx != nil {
+		go func() {
+			<-ts.ctx.Done()
+			_ = listen.Close()
+		}()
+	}
+
+	return ts.ServeTLS(listen, certFn, keyFn)
+}
+
+func (ts *TLSServer) ServeTLS(listen net.Listener, certFn string, keyFn string) error {
+
+	if ts.tlsConfig == nil {
+		ts.tlsConfig = &tls.Config{
+			CurvePreferences: []tls.CurveID{tls.CurveP256},
+			MinVersion:       tls.VersionTLS12,
+		}
+	}
+
+	if len(ts.tlsConfig.Certificates) == 0 && ts.tlsConfig.GetCertificate == nil {
+		cert, err := tls.LoadX509KeyPair(certFn, keyFn)
+		if err != nil {
+			return fmt.Errorf("load key pair: %v", err)
+		}
+
+		ts.tlsConfig.Certificates = []tls.Certificate{cert}
+
+	}
+
+	tlsListener := tls.NewListener(listen, ts.tlsConfig)
+
+	if ts.ready != nil {
+		close(ts.ready)
+	}
+
+	for {
+		conn, err := tlsListener.Accept()
+		if err != nil {
+			return fmt.Errorf("accept : %v", err)
+		}
+
+		go func() {
+			defer func() { _ = conn.Close() }()
+			for {
+				if ts.maxIdle > 0 {
+					err := conn.SetDeadline(time.Now().Add(ts.maxIdle))
+					if err != nil {
+						return
+					}
+				}
+
+				buf := make([]byte, 2048)
+
+				n, err := conn.Read(buf)
+
+				if err != nil {
+					return
+				}
+
+				_, err = conn.Write(buf[:n])
+
+				if err != nil {
+					return
+				}
+
+			}
+
+		}()
+
+	}
+
+	return nil
+}
+
+func TestNewTLSServer(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	serverAddress := "localhost:34443"
+	maxIdle := time.Second
+	server := NewTLSServer(ctx, serverAddress, maxIdle, nil)
+	done := make(chan struct{})
+
+	go func() {
+		err := server.ListenAndServeTLS("cert.pem", "key.pem")
+		if err != nil && !strings.Contains(err.Error(), "use of closed network connection") {
+			t.Error(err)
+			return
+		}
+		done <- struct{}{}
+	}()
+	server.Ready()
+
+	cert, err := ioutil.ReadFile("cert.pem")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	certPool := x509.NewCertPool()
+	ok := certPool.AppendCertsFromPEM(cert)
+	if !ok {
+		t.Fatal("failed to append certificate to pool")
+	}
+
+	tlsConfig := &tls.Config{
+		CurvePreferences: []tls.CurveID{tls.CurveP256},
+		MinVersion:       tls.VersionTLS12,
+		RootCAs:          certPool,
+	}
+
+	tlsDial, err := tls.Dial("tcp", server.addr, tlsConfig)
+	if err != nil {
+		t.Fatal(err)
+	}
+	hello := []byte("hello world")
+
+	_, err = tlsDial.Write(hello)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	buf := make([]byte, 2048)
+	n, err := tlsDial.Read(buf)
+	if err != nil {
+		t.Fatal(err)
+	}
+	actual := buf[:n]
+	if !bytes.Equal(hello, actual) {
+		t.Fatalf("expected : %q; actual : %q", hello, actual)
+	}
+	t.Logf("echo : %s", actual)
+
+	time.Sleep(2 * time.Second)
+
+	_, err = tlsDial.Read(buf)
+
+	if err != io.EOF {
+		t.Fatal(err)
+	}
+
+	err = tlsDial.Close()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	cancel()
+
+	<-done
+}
+
+func certPool(certFn string) (*x509.CertPool, error) {
+	cert, err := ioutil.ReadFile(certFn)
+	if err != nil {
+		return nil, errors.New("failed to read root certificate")
+	}
+
+	pool := x509.NewCertPool()
+	ok := pool.AppendCertsFromPEM(cert)
+	if !ok {
+		return nil, errors.New("failed to parse root certificate")
+	}
+
+	return pool, nil
+}
+
+func TestMutualTLS(t *testing.T) {
+	serverPool, err := certPool("clientCert.pem")
+	if err != nil {
+		t.Error(err)
+	}
+	serverCert, err := tls.LoadX509KeyPair("serverCert.pem", "serverKey.pem")
+	if err != nil {
+		t.Fatal(err)
+	}
+	serverTLSConfig := &tls.Config{
+		Certificates: []tls.Certificate{serverCert},
+		GetConfigForClient: func(info *tls.ClientHelloInfo) (*tls.Config, error) {
+			return &tls.Config{
+				CurvePreferences: []tls.CurveID{tls.CurveP256},
+				MinVersion:       tls.VersionTLS13,
+				Certificates:     []tls.Certificate{serverCert},
+				ClientAuth:       tls.RequireAndVerifyClientCert,
+				ClientCAs:        serverPool,
+				VerifyPeerCertificate: func(rawCerts [][]byte, verifiedChains [][]*x509.Certificate) error {
+					options := x509.VerifyOptions{
+						Roots:     serverPool,
+						KeyUsages: []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth},
+					}
+
+					ip := strings.Split(info.Conn.RemoteAddr().String(), ":")[0]
+
+					t.Logf("ip : %s", ip)
+					hostnames, err := net.LookupAddr(ip)
+					if err != nil {
+						t.Errorf("lookup ip : %v", err)
+					}
+
+					hostnames = append(hostnames, ip)
+
+					// add 127.0.0.1 localhost to host file
+					t.Logf("hostnames : %v", hostnames)
+					for _, chain := range verifiedChains {
+						options.Intermediates = x509.NewCertPool()
+
+						for _, cert := range chain[1:] {
+							options.Intermediates.AddCert(cert)
+						}
+
+						for _, hostname := range hostnames {
+							options.DNSName = hostname
+							_, err := chain[0].Verify(options)
+							if err == nil {
+								return nil
+							}
+						}
+					}
+					return errors.New("failed to verify client certificate")
+				},
+			}, nil
+		},
+	}
+
+	serverAddr := "localhost:34443"
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	server := NewTLSServer(ctx, serverAddr, 0, serverTLSConfig)
+
+	done := make(chan struct{})
+	go func() {
+		err := server.ListenAndServeTLS("serverCert.pem", "serverKey.pem")
+		if err != nil && !strings.Contains(err.Error(), "use of closed network connection") {
+			t.Error(err)
+			return
+		}
+		done <- struct{}{}
+	}()
+	server.Ready()
+
+	clientPool, err := certPool("serverCert.pem")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	clientCert, err := tls.LoadX509KeyPair("clientCert.pem", "clientKey.pem")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	clientTLSConfig := &tls.Config{
+		CurvePreferences: []tls.CurveID{tls.CurveP256},
+		MinVersion:       tls.VersionTLS13,
+		RootCAs:          clientPool,
+		Certificates:     []tls.Certificate{clientCert},
+	}
+
+	conn, err := tls.Dial("tcp", serverAddr, clientTLSConfig)
+
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	hello := []byte("hello world")
+	_, err = conn.Write(hello)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	buf := make([]byte, 2048)
+	n, err := conn.Read(buf)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	actual := buf[:n]
+	if !bytes.Equal(actual, hello) {
+		t.Fatalf("expected : %q; actual : %q\n", hello, actual)
+	}
+
+	cancel()
+	<-done
 }
