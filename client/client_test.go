@@ -6,6 +6,7 @@ import (
 	"context"
 	"crypto/tls"
 	"crypto/x509"
+	"encoding"
 	"encoding/binary"
 	"encoding/json"
 	"errors"
@@ -2422,6 +2423,7 @@ func TestMutualTLS(t *testing.T) {
 	if !bytes.Equal(actual, hello) {
 		t.Fatalf("expected : %q; actual : %q\n", hello, actual)
 	}
+	encoding.BinaryMarshaler()
 
 	cancel()
 	<-done
